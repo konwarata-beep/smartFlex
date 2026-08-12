@@ -892,11 +892,11 @@ const CONNECTIONS = [
 ];
 
 let appMode='personal', userData={}, localSettings={...DEFAULT_SETTINGS};
-let detector=null, detectorReady=false, stream=null, testStream=null, animationId=null;
+let detector=null, detectorReady=false, detectorMode='', stream=null, testStream=null, animationId=null;
 let testCanvas=document.createElement('canvas'), luminanceCanvas=document.createElement('canvas');
 let lastPoseResult=[], latestPersonal=null, latestReadiness=null, baseline=null, baselineCapture=null;
 let sessionState='idle', startedAt=null, sessionId='', stats=null, eventLog=[];
-let lastFrameAt=0, lastTickAt=0, lastInferenceAt=0, inferenceBusy=false, fpsSamples=[], currentFps=0;
+let lastFrameAt=0, lastTickAt=0, lastInferenceAt=0, lastInferenceSuccessAt=0, inferenceBusy=false, inferenceFailures=0, fpsSamples=[], currentFps=0;
 let issueTrackers={}, scoreChart=null, issueChart=null, reportRows=[], studentReportRows=[], pendingPayload=null;
 let classroomRoster=[], classroomStudentStats=[], classroomDistanceBaselines=[], classroomSeatCenters=[], latestClassroomSnapshot=null;
 let serverSettings={WARNING_SECONDS:5,SERIOUS_SECONDS:15,CRITICAL_SECONDS:30,ALERT_COOLDOWN_SECONDS:20,EYE_BREAK_SECONDS:600,POSTURE_BREAK_SECONDS:1200,STRETCH_BREAK_SECONDS:3600,MIN_DATA_COVERAGE:.5};
@@ -1315,6 +1315,20 @@ function saveLocalSettings(){localSettings={deviceType:$('setDeviceType').value,
 $('saveSettingsBtn').addEventListener('click',saveLocalSettings);$('setVolume').addEventListener('input',e=>$('volumeValue').textContent=Number(e.target.value).toFixed(1));$('setRate').addEventListener('input',e=>$('rateValue').textContent=Number(e.target.value).toFixed(1));
 
 async function loadScriptFallback(urls,label){let lastError;for(const url of urls){try{await new Promise((resolve,reject)=>{const existing=[...document.scripts].find(s=>s.src===url);if(existing&&existing.dataset.loaded==='1')return resolve();const s=document.createElement('script');s.src=url;s.async=true;s.onload=()=>{s.dataset.loaded='1';resolve()};s.onerror=()=>reject(new Error('โหลด '+label+' ไม่สำเร็จ'));document.head.appendChild(s)});return;}catch(err){lastError=err}}throw lastError||new Error('โหลด '+label+' ไม่สำเร็จ');}
+async function createDetectorForMode(){
+  const wantedMode=appMode==='classroom'?'multi':'single';
+  if(detector&&detectorMode===wantedMode)return detector;
+  if(detector&&typeof detector.dispose==='function'){try{detector.dispose()}catch(error){console.warn('Detector dispose failed',error)}}
+  detector=null;detectorReady=false;detectorMode='';
+  const multi=wantedMode==='multi';
+  setLoading(true,multi?'กำลังเตรียม MoveNet MultiPose...':'กำลังเตรียม MoveNet SinglePose...',78,multi?'รองรับนักเรียนหลายคน':'โหมดเร็วสำหรับตรวจหนึ่งคน');
+  const detectorConfig=multi
+    ?{modelType:poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,enableTracking:true,minPoseScore:.12,multiPoseMaxDimension:256}
+    :{modelType:poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,enableSmoothing:true,minPoseScore:.12};
+  if(multi&&poseDetection.TrackerType?.BoundingBox)detectorConfig.trackerType=poseDetection.TrackerType.BoundingBox;
+  detector=await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet,detectorConfig);
+  detectorMode=wantedMode;detectorReady=true;return detector;
+}
 async function ensureLibraries(){
   setLoading(true,'กำลังโหลด TensorFlow.js...',20,'ครั้งแรกอาจใช้เวลา 10–30 วินาที');
   if(!window.tf){
@@ -1331,23 +1345,25 @@ async function ensureLibraries(){
     ],'Pose Detection');
   }
   await tf.ready();
-  try{await tf.setBackend('webgl');await tf.ready()}catch(e){console.warn('WebGL unavailable',e)}
-  if(!detector){
-    setLoading(true,'กำลังเตรียม MoveNet MultiPose...',78);
-    const detectorConfig={modelType:poseDetection.movenet.modelType.MULTIPOSE_LIGHTNING,enableTracking:true,minPoseScore:.15,multiPoseMaxDimension:256};
-    if(poseDetection.TrackerType?.BoundingBox)detectorConfig.trackerType=poseDetection.TrackerType.BoundingBox;
-    detector=await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet,detectorConfig);
+  let backendReady=!!tf.getBackend();
+  if(!backendReady){
+    try{backendReady=await tf.setBackend('webgl');await tf.ready()}catch(error){console.warn('WebGL unavailable',error)}
   }
-  detectorReady=true;$('readyAi').textContent='พร้อม';setLoading(true,'AI พร้อมใช้งาน',100);
+  if(!backendReady){
+    try{backendReady=await tf.setBackend('cpu');await tf.ready()}catch(error){console.warn('CPU backend unavailable',error)}
+  }
+  if(!backendReady&&!tf.getBackend())throw new Error('อุปกรณ์นี้ไม่สามารถเริ่มระบบประมวลผล AI ได้');
+  await createDetectorForMode();
+  inferenceFailures=0;$('readyAi').textContent='พร้อม · '+(detectorMode==='single'?'ตรวจเดี่ยว':'ตรวจหลายคน');setLoading(true,'AI พร้อมใช้งาน',100);
 }
 
 async function enumerateCameras(){if(!navigator.mediaDevices?.enumerateDevices)return;const devices=await navigator.mediaDevices.enumerateDevices();const cameras=devices.filter(d=>d.kind==='videoinput');const select=$('cameraDevice');const current=localSettings.deviceId;select.innerHTML='<option value="">เลือกอัตโนมัติ</option>'+cameras.map((d,i)=>`<option value="${escapeHtml(d.deviceId)}">${escapeHtml(d.label||'กล้อง '+(i+1))}</option>`).join('');if(current&&cameras.some(c=>c.deviceId===current))select.value=current;const selected=cameras.find(c=>c.deviceId===select.value);$('setCameraName').textContent=selected?.label||'อัตโนมัติ';}
 function videoConstraints(settings=localSettings){const selected=String(settings.resolution);const height=selected==='480'?480:selected==='1080'?1080:720;const width=height===480?854:height===1080?1920:1280;const video={width:{ideal:width},height:{ideal:height}};if(settings.deviceId)video.deviceId={exact:settings.deviceId};else video.facingMode={ideal:settings.facingMode||'user'};return{video,audio:false};}
-async function openStream(targetVideo,settings=localSettings){if(!navigator.mediaDevices?.getUserMedia)throw new Error('เบราว์เซอร์นี้ไม่รองรับการเปิดกล้อง กรุณาใช้ Chrome, Safari หรือ Edge รุ่นปัจจุบัน');const media=await navigator.mediaDevices.getUserMedia(videoConstraints(settings));targetVideo.srcObject=media;await targetVideo.play();await enumerateCameras();return media;}
+async function openStream(targetVideo,settings=localSettings){if(!window.isSecureContext&&location.protocol!=='file:')throw new Error('กล้องใช้งานได้เมื่อเปิดผ่าน HTTPS หรือ localhost เท่านั้น');if(!navigator.mediaDevices?.getUserMedia)throw new Error('เบราว์เซอร์นี้ไม่รองรับการเปิดกล้อง กรุณาใช้ Chrome, Safari หรือ Edge รุ่นปัจจุบัน');const media=await navigator.mediaDevices.getUserMedia(videoConstraints(settings));targetVideo.srcObject=media;await new Promise((resolve,reject)=>{if(targetVideo.readyState>=1&&targetVideo.videoWidth)return resolve();let done=false;const finish=()=>{if(done)return;done=true;clearTimeout(timer);targetVideo.removeEventListener('loadedmetadata',finish);targetVideo.removeEventListener('canplay',finish);resolve()};const timer=setTimeout(()=>{if(done)return;done=true;targetVideo.removeEventListener('loadedmetadata',finish);targetVideo.removeEventListener('canplay',finish);reject(new Error('กล้องเปิดแล้วแต่ยังส่งภาพไม่ได้ กรุณาลองเปลี่ยนกล้องหรือความละเอียด'))},10000);targetVideo.addEventListener('loadedmetadata',finish,{once:true});targetVideo.addEventListener('canplay',finish,{once:true})});await targetVideo.play();await enumerateCameras();return media;}
 function cameraError(error){if(error?.name==='NotAllowedError')return'ยังไม่ได้อนุญาตใช้กล้อง กรุณากดไอคอนกล้องข้างแถบที่อยู่แล้วเลือกอนุญาต';if(error?.name==='NotFoundError')return'ไม่พบกล้องในอุปกรณ์';if(error?.name==='NotReadableError')return'กล้องกำลังถูกโปรแกรมอื่นใช้งาน กรุณาปิดแอปกล้องหรือประชุมออนไลน์ก่อน';if(error?.name==='OverconstrainedError')return'กล้องไม่รองรับค่าที่เลือก กรุณาเปลี่ยนความละเอียดหรือเลือกอัตโนมัติ';return error?.message||String(error);}
 
 async function startFromForm(){
-  const form=$('setupForm');if(!form.reportValidity())return;
+  const form=$('setupForm');if(!form.reportValidity()){showToast('กรุณากรอกข้อมูลที่จำเป็นและยืนยันการประมวลผลบนอุปกรณ์',6500);return;}
   try{userData=collectUserData()}catch(error){showToast(error.message,7000);return}
   localStorage.setItem(STORAGE_KEYS.user,JSON.stringify(userData));
   if(appMode==='classroom')localStorage.setItem(STORAGE_KEYS.classroomRoster,JSON.stringify(userData.students));
@@ -1376,7 +1392,7 @@ async function openMainCamera(){
   classroomRoster=appMode==='classroom'?[...(userData.students||[])]:[];
   classroomStudentStats=classroomRoster.map(newStudentStat);
   classroomDistanceBaselines=[];classroomSeatCenters=[];latestClassroomSnapshot=null;
-  eventLog=[];startedAt=null;sessionId=uuid('SS');lastFrameAt=performance.now();lastInferenceAt=0;fpsSamples=[];
+  eventLog=[];startedAt=null;sessionId=uuid('SS');lastFrameAt=performance.now();lastInferenceAt=0;lastInferenceSuccessAt=0;inferenceFailures=0;fpsSamples=[];
   $('baselineBtn').classList.toggle('hidden',appMode==='classroom');
   $('runBtn').disabled=true;$('finishBtn').disabled=true;
   $('pauseBtn').classList.add('hidden');$('resumeBtn').classList.add('hidden');$('runBtn').classList.remove('hidden');
@@ -1386,9 +1402,9 @@ async function openMainCamera(){
 function stopMainCamera(reset=true){if(animationId)cancelAnimationFrame(animationId);animationId=null;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}inferenceBusy=false;if(reset){sessionState='idle';const ctx=$('overlay').getContext('2d');ctx.clearRect(0,0,$('overlay').width,$('overlay').height);}}
 $('stopCameraBtn').addEventListener('click',()=>{stopMainCamera();showToast('หยุดกล้องแล้ว');showScreen('setupScreen')});
 
-function configureMonitor(){const classroom=appMode==='classroom';$('monitorModeBadge').textContent=classroom?'โหมดห้องเรียน · มุมตรง':'โหมดส่วนบุคคล';$('monitorHeading').textContent='ตรวจท่านั่งด้วยกล้อง';$('monitorSubheading').textContent=classroom?'ตรวจหลายคนจากด้านหน้า เรียงรายชื่อซ้ายไปขวา โดยไม่จดจำใบหน้า':'ให้เห็นจุดร่างกายตามมุมกล้องที่เลือก';$('cameraMessage').textContent=classroom?'มุมตรงด้านหน้า: จัดนักเรียนตามรายชื่อจากซ้ายไปขวา ให้เห็นศีรษะ ไหล่ ศอก สะโพก และเข่าครบทุกคน':localSettings.cameraAngle==='side'?'มุมด้านข้าง: ถอยกล้องให้เห็นเต็มตัวตั้งแต่ศีรษะถึงข้อเท้า':'กล้องพร้อมแล้ว ลองขยับตัวให้เห็นในเฟรม';$('runBtn').textContent=classroom?'เริ่มตรวจห้องเรียน':'เริ่มตรวจ';$('soundBtn').textContent='🔔 ปิด/เปิดเสียง';$('soundMetricStatus').textContent=localSettings.soundEnabled?'🔔 เปิด':'🔕 ปิด';updateStatus('ready',classroom?'ตรวจมุมตรงและตำแหน่งรายชื่อก่อนเริ่ม':'ตรวจความพร้อมของภาพก่อนเริ่ม');}
+function configureMonitor(){const classroom=appMode==='classroom';$('monitorModeBadge').textContent=classroom?'โหมดห้องเรียน · มุมตรง':'โหมดส่วนบุคคล · มุม'+({front:'ตรง',diagonal:'เฉียง',side:'ข้าง'}[localSettings.cameraAngle]||'เฉียง');$('monitorHeading').textContent='ตรวจท่านั่งด้วยกล้อง';$('monitorSubheading').textContent=classroom?'ตรวจหลายคนจากด้านหน้า เรียงรายชื่อซ้ายไปขวา โดยไม่จดจำใบหน้า':'AI จะแสดงโครงร่างทันที เมื่อภาพพร้อมกด “ตรวจ” ได้เลย';$('cameraMessage').textContent=classroom?'กำลังค้นหานักเรียน: จัดรายชื่อตามภาพจากซ้ายไปขวาและให้เห็นจุดร่างกายครบทุกคน':'กำลังค้นหาร่างกาย… ถอยกล้องให้เห็นศีรษะ ไหล่ ศอก และสะโพก';$('baselineBtn').textContent='ตั้งท่า';$('runBtn').textContent=classroom?'เริ่มตรวจห้องเรียน':'ตรวจ';$('soundBtn').textContent='🔔 ปิด/เปิดเสียง';$('soundMetricStatus').textContent=localSettings.soundEnabled?'🔔 เปิด':'🔕 ปิด';updateStatus('ready',classroom?'กำลังตรวจมุมตรงและจำนวนคน':'AI กำลังอ่านภาพจากกล้อง');}
 function startPredictionLoop(){if(!stream)return;animationId=requestAnimationFrame(predictFrame);}
-async function predictFrame(timestamp){if(!stream)return;animationId=requestAnimationFrame(predictFrame);const video=$('video');if(video.readyState<2||inferenceBusy||timestamp-lastInferenceAt<100)return;inferenceBusy=true;lastInferenceAt=timestamp;try{const poses=await detector.estimatePoses(video,{maxPoses:appMode==='classroom'?MAX_CLASSROOM_POSES:1,flipHorizontal:false});lastPoseResult=poses||[];updateFps(timestamp);processPoses(lastPoseResult,timestamp);}catch(error){console.error(error);$('cameraMessage').textContent='AI สะดุดชั่วคราว กำลังลองใหม่';}finally{inferenceBusy=false;}}
+async function predictFrame(timestamp){if(!stream)return;animationId=requestAnimationFrame(predictFrame);const video=$('video');if(video.readyState<2||!video.videoWidth||inferenceBusy||timestamp-lastInferenceAt<100)return;if(!detectorReady||!detector){$('cameraMessage').textContent='AI ยังไม่พร้อม กรุณาหยุดแล้วเปิดกล้องอีกครั้ง';return}inferenceBusy=true;lastInferenceAt=timestamp;try{const options=appMode==='classroom'?{maxPoses:MAX_CLASSROOM_POSES,flipHorizontal:false}:{flipHorizontal:false};const poses=await detector.estimatePoses(video,options);lastPoseResult=Array.isArray(poses)?poses:[];lastInferenceSuccessAt=performance.now();inferenceFailures=0;$('readyAi').textContent='พร้อม · '+(detectorMode==='single'?'ตรวจเดี่ยว':'ตรวจหลายคน');updateFps(timestamp);processPoses(lastPoseResult,timestamp);}catch(error){inferenceFailures++;console.error('Pose inference failed',error);if(inferenceFailures>=3){$('readyAi').textContent='กำลังลองใหม่';$('cameraMessage').textContent='AI อ่านภาพไม่ได้: '+cameraError(error)+' · กำลังลองใหม่อัตโนมัติ'}else $('cameraMessage').textContent='AI สะดุดชั่วคราว กำลังอ่านภาพใหม่';}finally{inferenceBusy=false;}}
 function updateFps(timestamp){if(lastFrameAt){const fps=1000/Math.max(1,timestamp-lastFrameAt);fpsSamples.push(fps);if(fpsSamples.length>20)fpsSamples.shift();currentFps=Math.round(fpsSamples.reduce((a,b)=>a+b,0)/fpsSamples.length);$('fpsChip').textContent='FPS '+currentFps;}lastFrameAt=timestamp;}
 
 function keypointMap(pose){const map={};(pose?.keypoints||[]).forEach(p=>{if(p?.name)map[p.name]=p});return map;}
@@ -1405,7 +1421,7 @@ const KEYPOINT_LABELS={nose:'ศีรษะ',left_ear:'หูซ้าย',righ
 function confidenceValue(metrics){const value=Number(metrics?.confidence??metrics?.visibility?.confidence??0);return Number.isFinite(value)?clamp(value,0,1):0;}
 function missingPointText(missing=[]){const labels=[...new Set(missing.map(k=>KEYPOINT_LABELS[k]||k))];return labels.length?labels.slice(0,5).join(', '):'ช่วงลำตัวและขา';}
 
-function evaluateVisibility(pose,angle=localSettings.cameraAngle){const map=keypointMap(pose);let required;if(angle==='side'){const left=['nose','left_ear','left_shoulder','left_elbow','left_wrist','left_hip','left_knee','left_ankle'];const right=['nose','right_ear','right_shoulder','right_elbow','right_wrist','right_hip','right_knee','right_ankle'];const lc=calculateConfidence(pose,left),rc=calculateConfidence(pose,right);required=lc>=rc?left:right;}else if(angle==='diagonal'){required=['nose','left_shoulder','right_shoulder','left_elbow','right_elbow','left_hip','right_hip','left_knee','right_knee'];}else required=['nose','left_shoulder','right_shoulder','left_elbow','right_elbow','left_hip','right_hip','left_knee','right_knee'];const missing=required.filter(k=>!visible(map[k],.25));const confidence=calculateConfidence(pose,required);const allowedMissing=angle==='side'?1:Math.max(1,Math.floor(required.length*.22));return{valid:missing.length<=allowedMissing&&confidence>=.35,missing,confidence,required};}
+function evaluateVisibility(pose,angle=localSettings.cameraAngle){const map=keypointMap(pose);let required;if(angle==='side'){const left=['nose','left_ear','left_shoulder','left_elbow','left_wrist','left_hip','left_knee','left_ankle'];const right=['nose','right_ear','right_shoulder','right_elbow','right_wrist','right_hip','right_knee','right_ankle'];const lc=calculateConfidence(pose,left),rc=calculateConfidence(pose,right);required=lc>=rc?left:right;}else if(angle==='diagonal'){required=['nose','left_shoulder','right_shoulder','left_elbow','right_elbow','left_hip','right_hip','left_knee','right_knee'];}else required=['nose','left_shoulder','right_shoulder','left_elbow','right_elbow','left_hip','right_hip','left_knee','right_knee'];const missing=required.filter(k=>!visible(map[k],.25));const confidence=calculateConfidence(pose,required);const allowedMissing=angle==='side'?1:2;const coreVisible=visible(map.nose,.25)&&(visible(map.left_shoulder,.25)||visible(map.right_shoulder,.25))&&(visible(map.left_hip,.25)||visible(map.right_hip,.25));return{valid:coreVisible&&missing.length<=allowedMissing&&confidence>=.30,missing,confidence,required};}
 function bodyMetrics(pose,canvas){
   const map=keypointMap(pose),angle=localSettings.cameraAngle,vis=evaluateVisibility(pose,angle),bodyHeight=poseBox(pose).height/Math.max(1,canvas.height);
   if(!vis.valid)return{valid:false,visibility:vis,confidence:vis.confidence,bodyHeight};
@@ -1538,8 +1554,9 @@ function processPersonal(pose,ctx,canvas,timestamp){
     const baselineEval=metrics.valid?evaluatePosture(metrics):null;
     const baselineReady=readiness.ready&&baselineEval&&baselineEval.score>=80;
     $('baselineBtn').disabled=!baselineReady||sessionState==='baseline';
-    updateStatus('ready',baselineReady?'พร้อมบันทึกท่ามาตรฐาน':'กรุณาจัดท่าและกล้องก่อน');
-    $('cameraMessage').textContent=baselineReady?'นั่งท่าที่ต้องการใช้เป็นมาตรฐาน แล้วกด “ตั้งท่ามาตรฐาน”':(baselineEval&&baselineEval.score<80?'ปรับท่าก่อนตั้งมาตรฐาน: '+Object.keys(baselineEval.issues).slice(0,2).map(k=>ISSUE_META[k].label).join(' · '):readiness.advice);
+    $('runBtn').disabled=!readiness.ready;
+    updateStatus('ready',readiness.ready?'พบร่างกายแล้ว · พร้อมเริ่มตรวจ':'กรุณาจัดตำแหน่งกล้องตามคำแนะนำ');
+    $('cameraMessage').textContent=readiness.ready?(baselineReady?'AI ตรวจพบแล้ว กด “ตรวจ” ได้เลย · หรือกด “ตั้งท่า” เพื่อเพิ่มความแม่นยำ':'AI ตรวจพบแล้ว กด “ตรวจ” ได้เลย ระบบจะใช้เกณฑ์มาตรฐาน'):(readiness.advice||'กำลังค้นหาร่างกาย…');
   }else{
     updateStatus('calibrated','บันทึกท่ามาตรฐานแล้ว กดเริ่มตรวจ');$('cameraMessage').textContent='พร้อมแล้ว กด “เริ่มตรวจ” เพื่อเริ่มจับเวลาและบันทึกผล';
   }
@@ -1640,7 +1657,7 @@ function updateReadinessUi(readiness){
   if(!readiness){
     $('missingPartsNotice').style.display='block';$('missingPartsNotice').textContent='ยังไม่พบร่างกาย กรุณาขยับกล้องให้เห็นจุดร่างกายตามมุมที่เลือก';
     $('readyLight').textContent='กำลังตรวจ';$('readyBody').textContent='ไม่พบ';$('readyDistance').textContent='ปรับกล้อง';
-    if(appMode==='classroom')$('runBtn').disabled=true;
+    if(sessionState!=='running')$('runBtn').disabled=true;
     return;
   }
   $('readyLight').textContent=readiness.light?'ผ่าน':'ควรปรับ';
@@ -1686,7 +1703,7 @@ function collectBaseline(metrics){
 $('baselineBtn').addEventListener('click',captureBaseline);
 
 function startSession(){
-  if(appMode==='personal'&&!baseline){showToast('กรุณาบันทึกท่ามาตรฐานก่อนเริ่มตรวจ');return}
+  if(appMode==='personal'&&(!latestPersonal?.valid||!latestReadiness?.ready)){showToast(latestReadiness?.advice||'กรุณาจัดกล้องให้ AI เห็นร่างกายก่อนเริ่มตรวจ',6500);return}
   if(appMode==='classroom'){
     if(!latestClassroomSnapshot?.ready||latestClassroomSnapshot.orderedPoses?.length!==classroomRoster.length){
       showToast(`ต้องเห็นนักเรียนครบ ${classroomRoster.length} คนและจุดร่างกายชัดก่อนเริ่ม`,7000);return;
@@ -1700,7 +1717,7 @@ function startSession(){
   $('liveLabel').textContent='กำลังตรวจ · Live';
   addEvent('SESSION','เริ่มตรวจ','info','เริ่ม Session',0);
   speakThai(appMode==='classroom'?'เริ่มตรวจท่านั่งนักเรียนและล็อกตำแหน่งที่นั่งแล้ว':'เริ่มตรวจท่านั่งแล้ว');
-  showToast(appMode==='classroom'?'เริ่มตรวจและล็อกตำแหน่งที่นั่งแล้ว':'เริ่มจับเวลาและประเมินแล้ว');
+  showToast(appMode==='classroom'?'เริ่มตรวจและล็อกตำแหน่งที่นั่งแล้ว':baseline?'เริ่มตรวจด้วยท่ามาตรฐานที่บันทึกไว้แล้ว':'เริ่มตรวจด้วยเกณฑ์มาตรฐานแล้ว');
 }
 $('runBtn').addEventListener('click',startSession);
 $('pauseBtn').addEventListener('click',()=>{sessionState='paused';$('pauseBtn').classList.add('hidden');$('resumeBtn').classList.remove('hidden');addEvent('SESSION','หยุดชั่วคราว','info','หยุดการตรวจชั่วคราว',0);showToast('หยุดชั่วคราวแล้ว')});
